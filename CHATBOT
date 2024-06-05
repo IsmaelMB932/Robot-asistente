@@ -1,0 +1,75 @@
+import openai
+import speech_recognition as sr
+import pyttsx3
+
+# Configura la API de OpenAI con tu clave
+openai.api_key = 'TU_API_KEY'
+
+# Inicializa el motor de conversión de texto a voz
+engine = pyttsx3.init()
+
+# Configura el reconocimiento de voz
+recognizer = sr.Recognizer()
+microphone = sr.Microphone()
+
+# Función para transcribir audio a texto
+def transcribe_audio_to_text():
+    with microphone as source:
+        print("Escuchando...")
+        # Ajusta el reconocimiento de ruido ambiental
+        recognizer.adjust_for_ambient_noise(source)
+        # Escucha el audio del micrófono
+        audio = recognizer.listen(source)
+    try:
+        print("Reconociendo...")
+        # Usa Google Web Speech API para transcribir el audio a texto
+        text = recognizer.recognize_google(audio, language="es-ES")
+        return text
+    except sr.UnknownValueError:
+        # Manejo de errores si el reconocimiento no entiende el audio
+        print("Lo siento, no entendí eso.")
+        return None
+    except sr.RequestError:
+        # Manejo de errores si hay problemas con la API de reconocimiento
+        print("No se pudo conectar al servicio de reconocimiento.")
+        return None
+
+# Función para obtener respuesta de ChatGPT
+def get_chatgpt_response(prompt):
+    # Envía la entrada del usuario a la API de OpenAI y obtiene la respuesta
+    response = openai.Completion.create(
+        engine="text-davinci-003",
+        prompt=prompt,
+        max_tokens=150
+    )
+    # Retorna la respuesta de ChatGPT
+    return response.choices[0].text.strip()
+
+# Función para convertir texto a voz y reproducirlo
+def speak_text(text):
+    # Usa pyttsx3 para convertir texto a voz
+    engine.say(text)
+    # Ejecuta la conversión y reproducción de la voz
+    engine.runAndWait()
+
+# Función principal del chatbot
+def main():
+    print("Iniciando chatbot de voz. Presiona Ctrl+C para salir.")
+    while True:
+        # Indica al usuario que hable
+        print("Por favor, hable ahora.")
+        # Transcribe el audio del usuario a texto
+        text = transcribe_audio_to_text()
+        if text:
+            # Muestra lo que el usuario dijo
+            print(f"Tú dijiste: {text}")
+            # Obtiene la respuesta de ChatGPT
+            response = get_chatgpt_response(text)
+            # Muestra la respuesta de ChatGPT
+            print(f"ChatGPT responde: {response}")
+            # Reproduce la respuesta de ChatGPT en voz
+            speak_text(response)
+
+# Punto de entrada del script
+if __name__ == "__main__":
+    main()
