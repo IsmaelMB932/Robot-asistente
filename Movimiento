@@ -1,0 +1,299 @@
+
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include "Queue.hpp"
+#include "MotorController.hpp"
+
+
+/// Definir asignación de pines
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+#define DIRECTION_L_PIN 12           // Pines de dirección del motor
+#define DIRECTION_R_PIN 13
+#define PWM_SPEED_L_PIN  3           // Pines PWM del motor
+#define PWM_SPEED_R_PIN 11
+#define BRAKE_L_PIN  9               // Pines de freno del motor
+#define BRAKE_R_PIN  8
+#define SERVO_ENABLE_PIN 10          // Pin de habilitación de salida del servo
+
+
+//#define BAT_L
+#ifdef BAT_L
+	#define BATTERY_LEVEL_PIN A2
+	#define BATTERY_MAX_VOLTAGE 12.6
+	#define BATTERY_MIN_VOLTAGE 10.2
+	#define DIVIDER_SCALING_FACTOR 0.3197
+
+
+/// Definir otras constantes
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+#define NUMBER_OF_SERVOS 7        // Número de motores servo
+#define SERVO_UPDATE_TIME 10      // Tiempo en milisegundos de cuán a menudo actualizar posiciones de servos y motores
+#define SERVO_OFF_TIME 6000       // Apagar motores servo después de 6 segundos
+#define STATUS_CHECK_TIME 10000   // Tiempo en milisegundos de cuán a menudo verificar el estado del robot
+#define CONTROLLER_THRESHOLD 1    // El error mínimo que el controlador de dinámicas intenta lograr
+#define MAX_SERIAL_LENGTH 5       // Número máximo de caracteres que pueden recibirse
+
+
+// Clase controladora del shield de servos - asume dirección por defecto 0x40
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// Configurar clases de controladores de motor
+MotorController motorL(DIRECTION_L_PIN, PWM_SPEED_L_PIN, BRAKE_L_PIN, false);
+MotorController motorR(DIRECTION_R_PIN, PWM_SPEED_R_PIN, BRAKE_R_PIN, false);
+
+// Animaciones 
+// para que el compilador sepa cuánta memoria dinámica se utilizará
+struct animation_t {
+	uint16_t timer;
+	int8_t servos[NUMBER_OF_SERVOS]; 
+};
+
+#define QUEUE_LENGTH 40
+animation_t buffer[QUEUE_LENGTH];
+Queue <animation_t> queue(QUEUE_LENGTH, buffer);
+
+/// Variables de control del motor
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+int pwmspeed = 255;
+int moveValue = 0;
+int turnValue = 0;
+int turnOffset = 0;
+int motorDeadzone = 0;
+
+/// Variables de ejecución
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+unsigned long lastTime = 0;
+unsigned long animeTimer = 0;
+unsigned long motorTimer = 0;
+unsigned long statusTimer = 0;
+unsigned long updateTimer = 0;
+bool autoMode = false;
+
+// Análisis de Serial
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+char firstChar;
+char serialBuffer[MAX_SERIAL_LENGTH];
+uint8_t serialLength = 0;
+
+// CALIBRACIÓN DE MOTORES SERVO 
+// Posiciones del Servo:  Bajo, Alto
+int preset[][2] =  {{410,120},  // rotación de la cabeza
+                    {340,135},  // brazo izquierdo
+                    {150,360}}; // brazo derecho
+
+// Control de Servos - Posición, Velocidad, Aceleración
+// -- -- -- -- -- -- -- -- -- -- -- -- -- --
+// Pines de los Servos:   0,   1,   2,   3,   4,   5,   6,   -,   -
+// Nombre de la Articulación:  cabeza, brazoI, brazoD, motL, motR
+float curpos[] = { 248, 560, 140, 475, 270, 250, 290, 180, 180};  // Posición actual (unidades)
+float setpos[] = { 248, 560, 140, 475, 270, 250, 290,   0,   0};  // Posición requerida (unidades)
+float curvel[] = {   0,   0,   0,   0,   0,   0,   0,   0,   0};  // Velocidad actual (unidades/seg)
+float maxvel[] = { 500, 400, 500,2400,2400, 600, 600, 255, 255};  // Velocidad máxima del Servo (unidades/seg)
+float accell[] = { 350, 300, 480,1800,1800, 500, 500, 800, 800};  // Aceleración del Servo (unidades/seg^2)
+
+// -------------------------------------------------------------------
+/// Configuración inicial
+// -------------------------------------------------------------------
+
+void setup() {
+
+	// Pin de Habilitación de Salida (EO) para los motores servo
+	pinMode(SERVO_ENABLE_PIN, OUTPUT);
+	digitalWrite(SERVO_ENABLE_PIN, HIGH);
+
+	// Comunicación con el shield de servos (Los servos analógicos funcionan a ~60Hz)
+	pwm.begin();
+	pwm.setPWMFreq(60);
+
+	// Apagar las salidas del servo
+	for (int i = 0; i < NUMBER_OF_SERVOS; i++) {
+		pwm.setPin(i, 0);
+	}
+
+	// Inicializar la comunicación serial para depuración
+	Serial.begin(115200);
+	Serial.println(F("--- Sketch de Control Wall-E ---"));
+
+	randomSeed(analogRead(0));
+
+	// Verificar si la cola de animaciones del servo está funcionando, y mover los servos a posiciones de inicio conocidas
+	if (queue.errors()) Serial.println(F("Error: No se puede asignar memoria para la cola de animaciones del servo"));
+	
+	// Arranque suave de los motores servo
+	Serial.println(F("Iniciando posiciones de Servos..."));
+	for (int i = 0; i < NUMBER_OF_SERVOS; i++) {
+		curpos[i] = setpos[i];
+		servowrite(i, setpos[i]);
+		delay(200);
+	}
+
+#ifdef BAT_L
+	#ifdef LED
+	  u8g2.begin();
+	#endif
+#endif
+}
+
+
+
+// Bucle principal
+
+void loop() {
+
+	// Calcular el tiempo transcurrido desde la última actualización
+	unsigned long currentTime = millis();
+	unsigned long deltaTime = currentTime - lastTime;
+	lastTime = currentTime;
+
+	// Comprobar el monitor serial
+	serialCheck();
+
+	// Si no hay nuevas actualizaciones
+	if (deltaTime == 0) return;
+
+	// Actualizar posición de los motores
+	updateMotors(deltaTime);
+
+	// Actualizar los motores servo
+	updateServos(deltaTime);
+
+	// Comprobar estado del robot
+	updateStatus(currentTime);
+
+	// Si hay animaciones programadas en la cola, ejecutar la siguiente
+	if (!queue.isEmpty()) {
+		animation_t step;
+		queue.dequeue(&step);
+		for (int i = 0; i < NUMBER_OF_SERVOS; i++) {
+			setpos[i] = step.servos[i];
+		}
+		animeTimer = currentTime + step.timer;
+	}
+}
+
+
+// Lectura y análisis de la entrada serial
+
+
+void serialCheck() {
+
+	// Verificar si hay datos disponibles
+	if (Serial.available()) {
+
+		// Leer un carácter
+		firstChar = Serial.read();
+
+		// Si el carácter es un comando de movimiento del motor
+		if (firstChar == 'M') {
+			serialBuffer[0] = firstChar;
+			serialLength = 1;
+			while (Serial.available() && serialLength < MAX_SERIAL_LENGTH) {
+				serialBuffer[serialLength++] = Serial.read();
+			}
+			serialBuffer[serialLength] = '\0';
+			if (serialLength == 3) {
+				moveValue = (int)serialBuffer[1] - '0';
+				turnValue = (int)serialBuffer[2] - '0';
+			}
+			else if (serialLength == 5) {
+				moveValue = (int)serialBuffer[1] - '0';
+				turnValue = (int)serialBuffer[2] - '0';
+				turnOffset = (int)serialBuffer[3] - '0';
+				motorDeadzone = (int)serialBuffer[4] - '0';
+			}
+		}
+
+		// Si el carácter es un comando de auto-modo
+		else if (firstChar == 'A') {
+			autoMode = !autoMode;
+			if (autoMode) Serial.println(F("Auto-mode Activado"));
+			else Serial.println(F("Auto-mode Desactivado"));
+		}
+	}
+}
+
+
+// Actualizar posiciones de los motores según la entrada serial
+
+void updateMotors(unsigned long deltaTime) {
+	if (moveValue == 0 && turnValue == 0 && autoMode == false) {
+		motorL.brake();
+		motorR.brake();
+	}
+	else {
+		int speedL = moveValue * (pwmspeed - motorDeadzone) + turnValue * turnOffset;
+		int speedR = moveValue * (pwmspeed - motorDeadzone) - turnValue * turnOffset;
+		if (speedL > 255) speedL = 255;
+		if (speedL < -255) speedL = -255;
+		if (speedR > 255) speedR = 255;
+		if (speedR < -255) speedR = -255;
+		motorL.setSpeed(speedL);
+		motorR.setSpeed(speedR);
+	}
+}
+
+
+// Actualizar posiciones de los servos según las animaciones en cola
+
+
+void updateServos(unsigned long deltaTime) {
+	if (currentTime > animeTimer) {
+		for (int i = 0; i < NUMBER_OF_SERVOS; i++) {
+			if (curpos[i] != setpos[i]) {
+				float diff = setpos[i] - curpos[i];
+				if (abs(diff) > CONTROLLER_THRESHOLD) {
+					if (diff > 0) curvel[i] += accell[i] * (deltaTime / 1000.0);
+					else curvel[i] -= accell[i] * (deltaTime / 1000.0);
+					if (curvel[i] > maxvel[i]) curvel[i] = maxvel[i];
+					if (curvel[i] < -maxvel[i]) curvel[i] = -maxvel[i];
+					curpos[i] += curvel[i] * (deltaTime / 1000.0);
+					if ((curvel[i] > 0 && curpos[i] > setpos[i]) || (curvel[i] < 0 && curpos[i] < setpos[i])) curpos[i] = setpos[i];
+					servowrite(i, curpos[i]);
+				}
+				else {
+					curvel[i] = 0;
+					curpos[i] = setpos[i];
+					servowrite(i, curpos[i]);
+				}
+			}
+		}
+	}
+}
+
+
+// Verificar el estado del robot y tomar medidas si es necesario
+
+
+void updateStatus(unsigned long currentTime) {
+	if (currentTime - statusTimer > STATUS_CHECK_TIME) {
+		statusTimer = currentTime;
+#ifdef BAT_L
+		int batteryValue = analogRead(BATTERY_LEVEL_PIN);
+		float batteryVoltage = batteryValue * (BATTERY_MAX_VOLTAGE / 1023.0) / DIVIDER_SCALING_FACTOR;
+		if (batteryVoltage < BATTERY_MIN_VOLTAGE) {
+			Serial.println(F("Advertencia: Batería baja"));
+		}
+		Serial.print(F("Nivel de Batería: "));
+		Serial.print(batteryVoltage);
+		Serial.println(F("V"));
+		#ifdef LED
+			u8g2.clearBuffer();
+			u8g2.setFont(u8g2_font_ncenB08_tr);
+			u8g2.drawStr(0, 10, "Nivel de Batería:");
+			u8g2.setCursor(0, 30);
+			u8g2.print(batteryVoltage);
+			u8g2.print(F("V"));
+			u8g2.sendBuffer();
+		#endif
+#endif
+	}
+}
+
+
+// Escribir la posición del servo en el shield
+
+
+void servowrite(uint8_t servoNum, float pos) {
+	uint16_t pulselen = map(pos, 0, 180, preset[servoNum][0], preset[servoNum][1]);
+	pwm.setPWM(servoNum, 0, pulselen);
+}
